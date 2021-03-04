@@ -1,199 +1,246 @@
 mod test;
 
-extern crate stft;
 extern crate cpal;
 
-use stft::{STFT, WindowType, log10_positive};
 use cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
-use std::sync::mpsc;
-use num::complex::Complex;
-use std::cmp::Ordering;
 
-struct HyperParams {
-    q: f64,
-    p: f64,
-    r: f64,
-    rho: f64,
-    num_harms: usize
+
+const MIN_FREQ: usize = 50;
+const MAX_FREQ: usize = 500;
+const NBITS: usize = core::mem::size_of::<u32>() * 8;
+const SAMPLES_PER_SECOND: usize = 44100;
+const MIN_PERIOD: usize = SAMPLES_PER_SECOND / MAX_FREQ;
+const MAX_PERIOD: usize = SAMPLES_PER_SECOND / MIN_FREQ;
+const BUFF_SIZE: usize = get_smallest_pow2(MAX_PERIOD) * 2;
+const ARRAY_SIZE: usize = BUFF_SIZE / NBITS;
+const MID_ARRAY: usize = ((ARRAY_SIZE / 2) - 1) as usize ;
+const MID_POS: usize = (BUFF_SIZE / 2) as usize;
+
+struct Config {
+    nbits: usize,
+    samples_per_second: usize,
+    min_period: usize,
+    max_period: usize,
+    buff_size: usize,
+    array_size: usize,
+    mid_array: usize,
+    mid_pos: usize
 }
 
-struct TWMConfig {
-    amplitude_threshhold: f32,
-    max_error: f32,
-    min_freq:f32,
-    max_freq: f32,
-    hyper_params: &'static HyperParams
-}
-
-
-const HYPER_PARAMS: &'static HyperParams = &HyperParams{
-    p: 0.5,
-    q: 1.4,
-    r: 0.5,
-    rho: 0.33,
-    num_harms: 10
+const CONFIG: Config = Config{
+    nbits: NBITS,
+    samples_per_second: SAMPLES_PER_SECOND,
+    min_period: MIN_PERIOD,
+    max_period: MAX_PERIOD,
+    buff_size: BUFF_SIZE,
+    array_size: ARRAY_SIZE,
+    mid_array: MID_ARRAY,
+    mid_pos: MID_POS
 };
 
-const TWM_CONFIG: &'static TWMConfig = &TWMConfig{
-    amplitude_threshhold: -80.0,
-    max_error: 5.0,
-    min_freq: 100.0,
-    max_freq: 3000.0,
-    hyper_params: HYPER_PARAMS
-};
+const NOTES: [&str; 12] = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
 
-
-fn to_db_mag_phase(x: Complex<f32>) -> (f32, f32) {
-    let (mag, phase) = x.to_polar();
-    let mag_in_db = 20.0 * log10_positive(mag);
-    (mag_in_db, phase)
+struct Bitstream {
+    bits: [u32; ARRAY_SIZE]
 }
 
-
-/// Takes a minimum threshold and a vector of (magnitudes, phases), and returns
-/// a vector of indices of local maxima above the threshold.
-pub fn detect_peaks(amplitude_threshold: f32, mag_phase_spectrum: Vec<(f32, f32)>) -> Vec<usize> {
-    // Drop first and last elements, used in indexing.
-    let len = mag_phase_spectrum.len();
-    let indexed_spectrum = &mag_phase_spectrum.clone()
-        .into_iter()
-        .enumerate()
-        .collect::<Vec<(usize, (f32, f32))>>()[1..len-1];
-    let filtered = indexed_spectrum.into_iter()
-        .map(|(_, (mag,_))| if mag >= &amplitude_threshold { mag } else { &0.0 });
-    let next = indexed_spectrum.into_iter()
-        .map(|(ind, (mag, _))| if mag > &mag_phase_spectrum[ind+1].0 { mag } else { &0.0 });
-    let prev = indexed_spectrum.into_iter()
-        .map(|(ind, (mag, _))| if mag > &mag_phase_spectrum[ind-1].0 { mag } else { &0.0 });
-    filtered
-        .zip(next)
-        .zip(prev)
-        .enumerate()
-        .fold(Vec:: new(), |mut init, (i, ((f, n), p))| if f * n * p != 0.0 {
-            init.push(i + 1);
-            init
-        } else { init })
+#[derive(Clone, Debug)]
+struct ZeroCross {
+    y: bool
 }
 
+impl ZeroCross {
+    fn new() -> Self {
+        ZeroCross { y: false }
+    }
 
-/// linear interpolation determines, from two points (x0,y0) and (x1,y1), what the value of y is at a different point x3.
-/// Linear interpolation assumes a linear slope between points 1 and 2 and based on that slope will determine what the value of
-/// y would be at another given point x.
-pub fn linear_interpoliation(p1: (f32, f32), p2: (f32, f32), x: f32) -> f32 {
-    let slope = (p2.1 - p1.1) / (p2.0 - p1.0);
-    p1.1 + (x - p1.0) * slope
-}
-
-fn get_adj_vals<T>(vec: &Vec<T>, i: usize) -> (&T, &T, &T) {
-    (&vec[i -1], &vec[i], &vec[i + 1])
-}
-
-fn get_imaginary_peak_mag(p: f32, l: f32, m: f32, r: f32) -> f32 {
-    p + 0.5 * (l - r)/(l - 2.0 * m + r)
+    fn run(&mut self, s: f32) -> bool {
+        if s < -0.1 {
+            self.y = false
+        }
+        if s > 0.0 {
+            self.y = true
+        }
+        self.y
+    }
 }
 
 
 
-pub fn interpolate_peaks(mag_phase_spectrum: Vec<(f32, f32)>, magnitude_peaks: Vec<usize>, sampling_rate: i32, window_len: usize) -> Vec<(f32, f32, f32)> {
-    let ipm = |i: usize| {
-        let (ml, mm, mr) = get_adj_vals(&mag_phase_spectrum, i);
-        let ipeak = get_imaginary_peak_mag(i as f32, ml.0, mm.0, mr.0);
-        let imag = mm.0 - 0.25 * (ml.0 - mr.0) * (ipeak - i as f32);
-        let ind= ipeak.floor();
-        let p1 = (ind, mag_phase_spectrum[ind as usize].1);
-        let p2 = (ind + 1.0, mag_phase_spectrum[ind as usize + 1].1);
-        let iphase = linear_interpoliation(p1, p2, ipeak);
-        (indice_to_freq(ipeak, sampling_rate, window_len), imag, iphase)
-    };
-    magnitude_peaks
-        .into_iter()
-        .map(ipm)
-        .collect::<Vec<(f32, f32, f32)>>()
+/// Calculate the smallest power of 2 greater than n.
+/// Useful for getting the appropriate buffer size
+const fn get_smallest_pow2(n: usize) -> usize {
+    const fn smallest_pow2(n: usize, m: usize) -> usize {
+        if m < n { smallest_pow2(n, m << 1) } else { m }
+    }
+    smallest_pow2(n, 1)
 }
 
-/// Converts the first element in the tuple from an index to a frequency
-fn indice_to_freq(ind: f32, sampling_rate: i32, window_len: usize) -> f32 {
-    sampling_rate as f32 * (ind / window_len as f32)
+impl Bitstream {
+
+    fn new() -> Self {
+        Bitstream { bits: [0; CONFIG.array_size] }
+    }
+
+    // fn clear(&mut self) {
+    //     self.bits.iter_mut().for_each(|x| *x = 0)
+    // }
+
+    fn set(&mut self, i: usize, val: bool) {
+        // Gets the section of 32 bits
+        // where i resides
+        let bs = &mut self.bits[i / CONFIG.nbits];
+
+        // Creates a bitmask the 1 is at
+        // the location of interest in the 32 bits
+        let mask = 1 << (i % CONFIG.nbits);
+
+        // will be either all zeros or all ones.
+        // All zeros is identity element with XOR
+        let id= if val { u32::MAX } else { 0 };
+        *bs ^= (id ^ *bs) & mask;
+    }
+
+    fn get(&self, i: usize) -> bool {
+        let mask = 1 << (i % CONFIG.nbits);
+        (self.bits[i / CONFIG.nbits] & mask) != 0
+    }
+
+    fn autocorrelate(&self, start_pos: usize) -> (u32, usize, [u32; CONFIG.mid_pos]) {
+
+        let mut corr = [0; CONFIG.mid_pos];
+        let mut max_count = 0;
+        let mut min_count = u32::MAX;
+        let mut est_index = 0;
+        let mut index = start_pos / CONFIG.nbits;
+        let mut shift = start_pos % CONFIG.nbits;
+
+        for pos in start_pos..CONFIG.mid_pos {
+            let mut p1 = 0;
+            let mut p2 = index;
+            let mut count = 0;
+            if shift == 0 {
+                for _ in 0..CONFIG.mid_array {
+                    count += (self.bits[p1] ^ self.bits[p2]).count_ones();
+                    p1 += 1;
+                    p2 += 1;
+                }
+            } else {
+                let shift2 = CONFIG.nbits - shift;
+                for _ in 0..CONFIG.mid_array {
+                    let mut v = self.bits[p2] >> shift;
+                    p2 += 1;
+                    v |= self.bits[p2] << shift2;
+                    count += (self.bits[p1] ^ v).count_ones();
+                    p1 += 1;
+
+                }
+            }
+            shift += 1;
+            if shift == CONFIG.nbits {
+                shift = 0;
+                index += 1;
+            }
+
+            corr[pos] = count;
+            max_count = max_count.max(count);
+            if count < min_count {
+                min_count = count;
+                est_index = pos;
+            }
+        }
+        (max_count, est_index, corr)
+    }
+
+    fn handle_harmonics(max_count: u32, est_index: usize, corr: &mut [u32; CONFIG.mid_pos]) -> usize {
+        let sub_threshold = 0.15 * max_count as f32;
+        let max_div = est_index / CONFIG.min_period;
+        let mut est_index = est_index as f32;
+        for div in (0..max_div).rev() {
+            let mut all_strong = true;
+            let mul = 1.0 / div as f32;
+            for k in 1..div {
+                let sub_period = k + (est_index * mul) as usize;
+                if corr[sub_period] > sub_threshold as u32 {
+                    all_strong = false;
+                    break;
+                }
+            }
+            if all_strong {
+                est_index = est_index * mul;
+                break;
+            }
+        }
+        return est_index as usize
+    }
+
+    fn estimate_pitch_with_index(signal: &Vec<f32>, est_index: usize) -> Option<f32> {
+        if est_index >= CONFIG.buff_size {
+            return None
+        }
+        let mut prev: f32 = 0.0;
+        let mut start_edge_index = 0;
+        let mut start_edge = signal[start_edge_index];
+        while start_edge <= 0.0 {
+            prev = start_edge;
+            start_edge_index += 1;
+            if start_edge_index >= CONFIG.buff_size {
+                return None
+            }
+            start_edge = signal[start_edge_index]
+        }
+
+        let dy1 = start_edge - prev;
+        let dx1 = -prev / dy1;
+
+        let mut next_edge_index = est_index - 1;
+        let mut next_edge = signal[next_edge_index];
+        while next_edge <= 0.0 {
+            prev = next_edge;
+            next_edge_index += 1;
+            if next_edge_index >= CONFIG.buff_size {
+                return None
+            }
+            next_edge = signal[next_edge_index]
+        }
+        let dy2 = next_edge - prev;
+        let dx2 = -prev / dy2;
+
+        let n_samples = (next_edge_index - start_edge_index) as f32 + (dx2 - dx1);
+        Some(CONFIG.samples_per_second as f32 / n_samples)
+    }
+
+    fn estimate_pitch(signal: &Vec<f32>) -> Option<f32> {
+        let mut zc = ZeroCross::new();
+        let mut bs = Bitstream::new();
+        for i in 0..CONFIG.buff_size {
+            bs.set(i, zc.run(signal[i]));
+        }
+        let (count, est_index, mut corr) = bs.autocorrelate(CONFIG.min_period);
+        let est_index = Bitstream::handle_harmonics(count, est_index, &mut corr);
+        Bitstream::estimate_pitch_with_index(&signal, est_index)
+    }
 }
 
+fn linear_to_db(freq: f32) -> f32 {
+    20.0 * freq.abs().log10()
+}
 
-fn process_candidate(f: f32, indexed_peakfreq_mag_phase: Vec<(usize, (f32,f32,f32))>) -> Vec<(usize, (f32,f32,f32))> {
-    let mut short_list = indexed_peakfreq_mag_phase.into_iter()
-        .filter(|(_, (freqs, _, _))| (freqs - f).abs() < f / 2.0)
-        .collect::<Vec<(usize, (f32, f32, f32))>>();
-    let max_mag = indexed_peakfreq_mag_phase.iter()
-        .max_by(|(_, (_, mag1, _)), (_, (_, mag2, _))| mag1.partial_cmp(&mag2).unwrap())
-        .unwrap();
-    let max_freq = max_mag.1.2 % f;
-
-    if max_freq > f / 2.0 {
-        if !indexed_peakfreq_mag_phase.contains(max_mag) && (f - max_freq) > (f / 4.0) {
-            short_list.push(*max_mag);
-            short_list
-        } else { short_list }
+fn freq_to_note<'a>(freq: f32) -> (&'a str, f32) {
+    let note_with_cents = 12.0 * (freq / 440.0).log2() + 69.0;
+    let note = (note_with_cents.round() as u32 % 12) as f32;
+    if note_with_cents > note {
+        (NOTES[note as usize], (note_with_cents - note))
     } else {
-        if !indexed_peakfreq_mag_phase.contains(max_mag) && max_freq > (f / 4.0) {
-            short_list.push(*max_mag);
-            short_list
-        } else { short_list }
-    }
-}
-
-
-
-fn f0twm(twm_conf: TWMConfig, peakfreq_mag_phase: Vec<(f32, f32, f32)>, last_candidate: Option<f32>) -> Option<f32> {
-    if peakfreq_mag_phase.len() < 3 && last_candidate.is_none() {
-        return None
-    }
-    let indexed_within_range = peakfreq_mag_phase.into_iter()
-        .enumerate()
-        .filter(|(_, (peakfreq, _, _))| peakfreq > &twm_conf.min_freq && peakfreq < &twm_conf.max_freq)
-        .collect::<Vec<(usize, (f32,f32,f32))>>();
-
-    if indexed_within_range.is_empty() == 0 {
-        return None
-    }
-    let f0cf = match last_candidate {
-        None => indexed_within_range,
-        Some(f) => process_candidate(f, indexed_within_range)
-    };
-    if f0cf.is_empty() {
-        return None
-    };
-
-    let (cand, err) = twm(twm_conf.hyper_params, peakfreq_mag_phase, f0cf);
-    if cand == 0 {
-        return None
-    };
-    if err > twm_conf.max_error {
-        return None
-    };
-    return Some(cand)
-}
-
-fn twm(hyper_params: &HyperParams, peakfreq_mag_phase: Vec<(f32, f32, f32)>, previous_candidates: Vec<(usize, (f32,f32,f32))>) -> (f32, f32) {
-    let errors: Vec<f32> = Vec::with_capacity(previous_candidates.len());
-    let max_npm = hyper_params.num_harms.min(peakfreq_mag_phase.len());
-
-}
-
-fn predicted_to_measured(max_npm: usize, f0_candidates: Vec<(usize, (f32,f32,f32))>, errors: Vec<f32>) -> Vec<f32> {
-    for i in 0..max_npm {
-        let dif_matrix = f0_candidates.into_iter().map()
+        (NOTES[note as usize], (note - note_with_cents))
     }
 }
 
 fn main() {
-    // let's initialize our short-time fourier transform
-    let window_type: WindowType = WindowType::Hanning;
-    let window_size: usize = 1024;
-    let step_size: usize = 512;
-    let positive_spectrum_idx: usize = window_size / 2 + 1;
+    // lowest frequency determines buf_size. We need twice the period worth of samples
+    // https://www.cycfi.com/2018/04/fast-and-efficient-pitch-detection-bliss/
 
-    let mut stft = STFT::<f32>::new(window_type, window_size, step_size);
-
-    let (sender, receiver) = mpsc::channel();
-
+    // let (sender, receiver) = mpsc::channel();
     let host = cpal::default_host();
     let device = host.default_input_device().expect("no input device available");
     let config = device
@@ -201,36 +248,25 @@ fn main() {
         .expect("no default config")
         .config();
 
+    let mut signal = Vec::with_capacity(CONFIG.buff_size);
+
     let stream = device.build_input_stream(
         &config,
         move |data: &[f32], _: &cpal::InputCallbackInfo| {
-            // react to stream events and read or write stream data here.
+
             // println!("{:?}", data);
-            stft.append_samples(data);
-
-            // as long as there remain window_size samples in the internal
-            // ringbuffer of the stft
-            while stft.contains_enough_to_compute() {
-                // compute one column of the stft by
-                // taking the first window_size samples of the internal ringbuffer,
-                // multiplying them with the window,
-                // computing the fast fourier transform,
-                // taking half of the symetric complex outputs,
-                // computing the norm of the complex outputs and
-                // taking the log10
-                stft.compute_into_complex_output();
-
-
-                // here's where you would do something with the
-                // spectrogram_column...
-                match sender.send(stft.complex_buffer.clone()) {
-                    Ok(_) => (),
-                    Err(e) => panic!(e)
-                };
-                // drop step_size samples from the internal ringbuffer of the stft
-                // making a step of size step_size
-                stft.move_to_next_column();
+            for d in data.iter() {
+                signal.push(*d);
             }
+            if signal.len() >= CONFIG.buff_size {
+                let est_freq = Bitstream::estimate_pitch(&signal);
+                est_freq.map(|f| {
+                    let (note, cents) = freq_to_note(f);
+                    println!("Note is: {}, cents is {:}", note, cents);
+                });
+                signal.clear();
+            }
+
         },
         move |err| {
             panic!(err);
@@ -240,10 +276,10 @@ fn main() {
 
     stream.play().unwrap();
     loop {
-        match receiver.recv() {
-            Ok(t) => print!("{:?}", t),
-            Err(e) => panic!(e)
-        }
+        // match receiver.recv() {
+        //     Ok(t) => print!("{:?}", t),
+        //     Err(e) => panic!(e)
+        // }
     }
 }
 

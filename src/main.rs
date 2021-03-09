@@ -390,6 +390,27 @@ fn cents_to_color(note: &str, cents: i32) -> ColoredString {
     }
 }
 
+fn process_signal(signal: &mut Vec<f32>, data: &[f32]) {
+    for d in data.iter() {
+        signal.push(*d);
+    }
+    if signal.len() >= CONFIG.buff_size {
+        let slice = &signal[0..CONFIG.buff_size];
+        let avg: f32 = slice.iter().fold(0.0, |x, y| x + y) / CONFIG.buff_size as f32;
+        if linear_to_db(avg) > CONFIG.amp_threshold {
+            let est_freq = Bitstream::estimate_pitch(slice);
+            est_freq.map(|f| {
+                let (note, cents) = freq_to_note(f);
+                print!("\x1B[2J\x1B[1;1H");
+                print!("{}", cents_to_color(note, cents));
+                io::stdout().flush().unwrap();
+                thread::sleep(time::Duration::from_millis(100));
+            });
+        }
+        signal.clear();
+    }
+}
+
 fn main() {
     // lowest frequency determines buf_size. We need twice the period worth of samples
     // https://www.cycfi.com/2018/04/fast-and-efficient-pitch-detection-bliss/
@@ -408,31 +429,8 @@ fn main() {
 
     let stream = device.build_input_stream(
         &config,
-        move |data: &[f32], _: &cpal::InputCallbackInfo| {
-
-            for d in data.iter() {
-                signal.push(*d);
-            }
-            if signal.len() >= CONFIG.buff_size {
-                let slice = &signal[0..CONFIG.buff_size];
-                let avg: f32 = slice.iter().fold(0.0, |x, y| x + y) / CONFIG.buff_size as f32;
-                if linear_to_db(avg) > CONFIG.amp_threshold {
-                    let est_freq = Bitstream::estimate_pitch(slice);
-                    est_freq.map(|f| {
-                        let (note, cents) = freq_to_note(f);
-                        print!("\x1B[2J\x1B[1;1H");
-                        print!("{}", cents_to_color(note, cents));
-                        io::stdout().flush().unwrap();
-                        thread::sleep(time::Duration::from_millis(100));
-                    });
-                }
-                signal.clear();
-            }
-        },
-        move |err| {
-            panic!(err);
-            // react to errors here.
-        },
+        move |data: &[f32], _: &cpal::InputCallbackInfo| process_signal(&mut signal, data),
+        move |err| { panic!(err); },
     ).unwrap();
 
     stream.play().unwrap();

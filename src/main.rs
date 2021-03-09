@@ -185,6 +185,20 @@ const B: &str = r#"
 ///////
 "#;
 
+const FLAT: &str = r#"
+     **
+   **/ **
+ **   // **
+//      //
+"#;
+
+const SHARP: &str = r#"
+/**   /**
+//** /**
+ //****
+  //**
+"#;
+
 const NOTES: [&str; 12] = [C, C_SHARP, D, D_SHARP, E, F, F_SHARP, G, G_SHARP, A, A_SHARP, B];
 
 struct Bitstream {
@@ -231,10 +245,10 @@ impl Bitstream {
     //     self.bits.iter_mut().for_each(|x| *x = 0)
     // }
 
-    // fn get(&self, i: usize) -> bool {
-    //     let mask = 1 << (i % CONFIG.nbits);
-    //     (self.bits[i / CONFIG.nbits] & mask) != 0
-    // }
+    fn get(&self, i: usize) -> bool {
+        let mask = 1 << (i % CONFIG.nbits);
+        (self.bits[i / CONFIG.nbits] & mask) != 0
+    }
 
     fn set(&mut self, i: usize, val: bool) {
         // Gets the section of 32 bits
@@ -390,6 +404,17 @@ fn cents_to_color(note: &str, cents: i32) -> ColoredString {
     }
 }
 
+fn print_message(note: &str, cents: i32) {
+    if cents < 0 {
+        print!("{}", cents_to_color(FLAT, cents));
+        print!("{}", cents_to_color(note, cents));
+    } else {
+        print!("\n\n\n\n\n");
+        print!("{}", cents_to_color(note, cents));
+        print!("{}", cents_to_color(SHARP, cents));
+    }
+}
+
 fn process_signal(signal: &mut Vec<f32>, data: &[f32]) {
     for d in data.iter() {
         signal.push(*d);
@@ -401,8 +426,8 @@ fn process_signal(signal: &mut Vec<f32>, data: &[f32]) {
             let est_freq = Bitstream::estimate_pitch(slice);
             est_freq.map(|f| {
                 let (note, cents) = freq_to_note(f);
-                print!("\x1B[2J\x1B[1;1H");
-                print!("{}", cents_to_color(note, cents));
+                print!("\x1B[2J\x1B[1;1H"); // clear terminal
+                print_message(note, cents);
                 io::stdout().flush().unwrap();
                 thread::sleep(time::Duration::from_millis(100));
             });

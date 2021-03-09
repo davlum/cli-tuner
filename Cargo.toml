@@ -1,5 +1,5 @@
 [package]
-name = "cli-tuner"
+name = "clituner"
 version = "0.1.0"
 authors = ["da.lum <david.lum91@gmail.com>"]
 edition = "2018"
@@ -9,3 +9,10 @@ edition = "2018"
 [dependencies]
 cpal = "*"
 colored = "2"
+
+[dev-dependencies]
+criterion = "0.3"
+
+[[bench]]
+name = "bench"
+harness = false

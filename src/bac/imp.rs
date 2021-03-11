@@ -3,8 +3,8 @@ extern crate cpal;
 use crate::bac::conf::CONFIG;
 
 
-pub struct Bitstream {
-    bits: [u32; CONFIG.array_size]
+pub struct Bitstream<'a> {
+    bits: &'a mut [u32]
 }
 
 #[derive(Clone, Debug)]
@@ -28,10 +28,10 @@ impl ZeroCross {
     }
 }
 
-impl Bitstream {
+impl<'a> Bitstream<'a> {
 
-    pub fn new() -> Self {
-        Bitstream { bits: [0; CONFIG.array_size] }
+    pub fn new(bits: &'a mut [u32]) -> Self {
+        Bitstream { bits }
     }
 
     // fn clear(&mut self) {
@@ -163,8 +163,9 @@ impl Bitstream {
     }
 
     pub fn estimate_pitch(signal: &[f32]) -> Option<f32> {
+        let mut array = [0; CONFIG.array_size];
         let mut zc = ZeroCross::new();
-        let mut bs = Bitstream::new();
+        let mut bs = Bitstream::new(&mut array);
         for i in 0..CONFIG.buff_size {
             bs.set(i, zc.run(signal[i]));
         }

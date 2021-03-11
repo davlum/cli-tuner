@@ -24,7 +24,8 @@ fn test_get_smallest_pow2() {
 
 #[test]
 fn test_imperative_bitstream() {
-    let mut bs = imp::Bitstream::new();
+    let mut array = [0; 64];
+    let mut bs = imp::Bitstream::new(&mut array);
     let i = 7;
     bs.set(i, true);
     assert_eq!(bs.get(i), true);
@@ -65,7 +66,8 @@ fn test_declarative_esimate_pitch() {
 #[test]
 fn test_imperative_autocorrelate() {
     let mut zc = imp::ZeroCross::new();
-    let mut bs = imp::Bitstream::new();
+    let mut array = [0; 64];
+    let mut bs = imp::Bitstream::new(&mut array);
     let signal = generate_input();
     for i in 0..conf::CONFIG.buff_size {
         bs.set(i, zc.run(signal[i]));
@@ -95,7 +97,8 @@ fn test_declarative_autocorrelate() {
 #[test]
 fn test_imperative_handle_harmonics() {
     let mut zc = imp::ZeroCross::new();
-    let mut bs = imp::Bitstream::new();
+    let mut array = [0; 64];
+    let mut bs = imp::Bitstream::new(&mut array);
     let signal = generate_input();
     for i in 0..conf::CONFIG.buff_size {
         bs.set(i, zc.run(signal[i]));
